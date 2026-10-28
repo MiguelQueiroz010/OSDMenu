@@ -8,6 +8,9 @@
 
 PatcherSettings settings;
 
+// Parent folder (config file item index) of every item, indexed by config file item index. -1 means "root menu"
+static int16_t parentOfIdx[MAX_ITEM_IDX];
+
 // Defined in common/defaults.h
 #ifndef HOSD
 char cnfPath[] = CONF_PATH;
@@ -65,6 +68,45 @@ nextLine:
   *name = pName;    // Set found variable name
   *value = pValue;  // Set found variable value
   return 1;
+}
+
+// Converts parent item indexes from the config file into item positions,
+// drops invalid or cyclic parents and marks the folder items
+static void resolveMenuHierarchy(void) {
+  int i, k, step, p;
+
+  for (i = 0; i < settings.menuItemCount; i++) {
+    settings.menuItemParent[i] = -1;
+    settings.menuItemIsFolder[i] = 0;
+  }
+
+  // Find the parent position of each item
+  for (i = 0; i < settings.menuItemCount; i++) {
+    int wanted = parentOfIdx[settings.menuItemIdx[i]];
+    if (wanted < 0)
+      continue;
+    for (k = 0; k < settings.menuItemCount; k++) {
+      if (k != i && settings.menuItemIdx[k] == wanted) {
+        settings.menuItemParent[i] = k;
+        break;
+      }
+    }
+  }
+
+  // Break cycles: every chain must reach the root in at most menuItemCount steps
+  for (i = 0; i < settings.menuItemCount; i++) {
+    p = settings.menuItemParent[i];
+    for (step = 0; p >= 0 && step <= settings.menuItemCount; step++)
+      p = settings.menuItemParent[p];
+    if (p >= 0)
+      settings.menuItemParent[i] = -1;
+  }
+
+  // Mark the folders
+  for (i = 0; i < settings.menuItemCount; i++) {
+    if (settings.menuItemParent[i] >= 0)
+      settings.menuItemIsFolder[settings.menuItemParent[i]] = 1;
+  }
 }
 
 // Loads config file from the memory card
@@ -183,6 +225,17 @@ int loadConfig(void) {
         settings.colorUnselected[i] = strtol(valueBuf, NULL, 16);
         value += 5;
       }
+      continue;
+    }
+    if (!strncmp(name, "parent_OSDSYS_ITEM_", 19) && (strlen(value) > 0)) {
+      // Puts the item inside the folder item with the given index
+      j = atoi(&name[19]);
+      if (j >= 0 && j < MAX_ITEM_IDX)
+        parentOfIdx[j] = (int16_t)atoi(value);
+      continue;
+    }
+    if (!strcmp(name, "OSDSYS_submenu_back_text")) {
+      strncpy(settings.backText, value, sizeof(settings.backText) - 1);
       continue;
     }
     if (!strncmp(name, "name_OSDSYS_ITEM_", 17) && (strlen(value) > 0)) {
@@ -324,6 +377,8 @@ int loadConfig(void) {
   if (pCNF != NULL)
     free(pCNF);
 
+  resolveMenuHierarchy();
+
   return 0;
 }
 
@@ -368,6 +423,13 @@ void initConfig(void) {
     settings.menuItemIdx[i] = 0;
   }
   settings.menuItemCount = 0;
+  for (int i = 0; i < CUSTOM_ITEMS; i++) {
+    settings.menuItemParent[i] = -1;
+    settings.menuItemIsFolder[i] = 0;
+  }
+  for (int i = 0; i < MAX_ITEM_IDX; i++)
+    parentOfIdx[i] = -1;
+  strcpy(settings.backText, "< Back");
   settings.romver[0] = '\0';
 #ifndef HOSD
   settings.dkwdrvPath[0] = '\0'; // Can be null

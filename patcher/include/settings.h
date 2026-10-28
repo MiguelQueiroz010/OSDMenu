@@ -6,6 +6,7 @@
 
 #define CUSTOM_ITEMS 250 // Max number of items in custom menu
 #define NAME_LEN 80      // Max menu item length (incl. the string terminator)
+#define MAX_ITEM_IDX 1000 // Item indexes in the config file must be in range 0..MAX_ITEM_IDX-1
 
 typedef enum {
   FLAG_CUSTOM_MENU = (1 << 0),      // Apply menu patches
@@ -38,6 +39,9 @@ typedef struct {
   int displayedItems;                        // The number of menu items displayed, only for scroll menu
   int menuItemIdx[CUSTOM_ITEMS];             // Item index in the config file
   int menuItemCount;                         // Total number of valid menu items
+  int menuItemParent[CUSTOM_ITEMS];          // Position of the parent folder item (in menuItemName), -1 for the root menu
+  uint8_t menuItemIsFolder[CUSTOM_ITEMS];    // Set if at least one item has this item as its parent
+  char backText[NAME_LEN];                   // Text of the "back" entry shown at the top of submenus
   uint16_t patcherFlags;                     // Patcher options
   char leftCursor[20];                       // The left cursor text, only for scroll menu
   char rightCursor[20];                      // The right cursor text, only for scroll menu

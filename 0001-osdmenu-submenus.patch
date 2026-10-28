@@ -1,0 +1,384 @@
+diff --git a/README.md b/README.md
+index 96f1a0e..e1da684 100644
+--- a/README.md
++++ b/README.md
+@@ -217,6 +217,23 @@ New to OSDMenu/HOSDMenu:
+ 30. `ps1drv_enable_smooth` — will enable texture smoothing for PS1 discs when not using DKWDRV
+ 31. `ps1drv_use_ps1vn` — will run PS1DRV using the PS1DRV Video Mode Negator
+ 
++Submenus (fork):
++
++- `parent_OSDSYS_ITEM_???` — puts the item inside the folder item with the given index. An item that is the parent of at least one other item becomes a folder: selecting it opens its submenu instead of launching a path, and it needs no `path?_` entry. Items without `parent_` stay in the main menu. Invalid or circular parents are ignored (the item goes to the main menu). Not supported on protokernel consoles (SCPH-10000/15000), where all items are listed flat.
++- `OSDSYS_submenu_back_text` — text of the entry shown at the top of every submenu that returns to the previous level (default: `< Back`)
++
++Example:
++
++```
++name_OSDSYS_ITEM_1 = Games >
++name_OSDSYS_ITEM_2 = Game A
++path1_OSDSYS_ITEM_2 = mc0:/BOOT/NEUTRINO.ELF
++arg_OSDSYS_ITEM_2 = dvd:mass:/DVD/GameA.iso
++parent_OSDSYS_ITEM_2 = 1
++name_OSDSYS_ITEM_3 = uLaunchELF
++path1_OSDSYS_ITEM_3 = mc0:/BOOT/BOOT.ELF
++```
++
+ Options exclusive to OSDMenu:
+ 
+ 32. `path_DKWDRV_ELF` — custom path to DKWDRV.ELF. The path MUST be on the memory card
+diff --git a/patcher/include/settings.h b/patcher/include/settings.h
+index a066b4a..35d5a0c 100644
+--- a/patcher/include/settings.h
++++ b/patcher/include/settings.h
+@@ -6,6 +6,7 @@
+ 
+ #define CUSTOM_ITEMS 250 // Max number of items in custom menu
+ #define NAME_LEN 80      // Max menu item length (incl. the string terminator)
++#define MAX_ITEM_IDX 1000 // Item indexes in the config file must be in range 0..MAX_ITEM_IDX-1
+ 
+ typedef enum {
+   FLAG_CUSTOM_MENU = (1 << 0),      // Apply menu patches
+@@ -38,6 +39,9 @@ typedef struct {
+   int displayedItems;                        // The number of menu items displayed, only for scroll menu
+   int menuItemIdx[CUSTOM_ITEMS];             // Item index in the config file
+   int menuItemCount;                         // Total number of valid menu items
++  int menuItemParent[CUSTOM_ITEMS];          // Position of the parent folder item (in menuItemName), -1 for the root menu
++  uint8_t menuItemIsFolder[CUSTOM_ITEMS];    // Set if at least one item has this item as its parent
++  char backText[NAME_LEN];                   // Text of the "back" entry shown at the top of submenus
+   uint16_t patcherFlags;                     // Patcher options
+   char leftCursor[20];                       // The left cursor text, only for scroll menu
+   char rightCursor[20];                      // The right cursor text, only for scroll menu
+diff --git a/patcher/src/patches_fmcb.c b/patcher/src/patches_fmcb.c
+index 551ef9f..b3691a9 100644
+--- a/patcher/src/patches_fmcb.c
++++ b/patcher/src/patches_fmcb.c
+@@ -26,55 +26,148 @@ static struct OSDMenuInfo *menuInfo = NULL;
+ #define OSD_MAGIC 0x39390000 // arbitrary number to identify added menu items
+ char item[10] = {0};
+ 
+-// Handles custom menu entries
+-int handleMenuEntry(int selected) {
+-  if (selected == 1)
+-    return 1;
++#define OSD_BACK_ID 0xfffe // item id of the "back" entry shown in submenus
++
++static uint32_t rootHead[4];        // Original "Browser" and "System Configuration" entries
++static int currentFolder = -1;      // Position of the folder being displayed, -1 for the root menu
++static int visibleItems = 0;        // Number of custom entries (folders and items) in the displayed menu
++static int isProtokernelMenu = 0;   // Protokernel menus are flat (no submenu support)
++
++// Rebuilds the OSD menu array to show the contents of the given folder (-1 for the root menu)
++static void buildMenu(int folder) {
++  int i, n = 0;
++  uint32_t base;
++
++  if (folder < 0) {
++    for (i = 0; i < 4; i++)
++      osdMenu[i] = rootHead[i];
++    base = 4;
++  } else {
++    osdMenu[0] = OSD_MAGIC + OSD_BACK_ID;
++    osdMenu[1] = 0;
++    base = 2;
++  }
+ 
+-  if (selected >= 2 + settings.menuItemCount)
+-    return 0;
++  for (i = 0; i < settings.menuItemCount; i++) {
++    if (settings.menuItemParent[i] != folder)
++      continue;
++    osdMenu[base + n * 2] = OSD_MAGIC + i;
++    osdMenu[base + n * 2 + 1] = 0;
++    n++;
++  }
++
++  visibleItems = n;
++  currentFolder = folder;
++  menuInfo->menuPtr = osdMenu;
++  menuInfo->entryCount = (base / 2) + n;
++}
++
++static void enterFolder(int folder) {
++  buildMenu(folder);
++  menuInfo->currentEntry = 0; // Cursor starts on the "back" entry
++}
+ 
+-  if (selected - 2 >= 0) {
+-    // Build 'fmcb<mc slot>:<idx>' string for the launcher
+-    int idx = settings.menuItemIdx[selected - 2];
++static void leaveFolder(void) {
++  uint32_t i, folder = currentFolder;
+ 
+-    item[0] = 'f';
+-    item[1] = 'm';
+-    item[2] = 'c';
+-    item[3] = 'b';
++  buildMenu(settings.menuItemParent[folder]);
++
++  // Put the cursor back on the folder we just left
++  menuInfo->currentEntry = 0;
++  for (i = 0; i < menuInfo->entryCount; i++) {
++    if (osdMenu[i * 2] == OSD_MAGIC + folder) {
++      menuInfo->currentEntry = i;
++      break;
++    }
++  }
++}
++
++// Builds the 'fmcb<mc slot>:<idx>' string for the item at the given position and launches it
++static void launchConfigItem(int pos) {
++  int idx = settings.menuItemIdx[pos];
++
++  item[0] = 'f';
++  item[1] = 'm';
++  item[2] = 'c';
++  item[3] = 'b';
+ #ifndef HOSD
+-    item[4] = '0' + settings.mcSlot;
++  item[4] = '0' + settings.mcSlot;
+ #else
+-    item[4] = '9';
++  item[4] = '9';
+ #endif
+-    item[5] = ':';
+-
+-    if (idx < 10) {
+-      // For single-digit numbers
+-      item[6] = '0' + idx;
+-      item[7] = '\0';
+-    } else if (idx < 100) {
+-      // For two-digit numbers
+-      item[6] = '0' + (idx / 10);
+-      item[7] = '0' + (idx % 10);
+-      item[8] = '\0';
+-    } else {
+-      // For three-digit numbers
+-      item[6] = '0' + (idx / 100);
+-      item[7] = '0' + ((idx / 10) % 10);
+-      item[8] = '0' + (idx % 10);
+-      item[9] = '\0';
+-    }
++  item[5] = ':';
++
++  if (idx < 10) {
++    // For single-digit numbers
++    item[6] = '0' + idx;
++    item[7] = '\0';
++  } else if (idx < 100) {
++    // For two-digit numbers
++    item[6] = '0' + (idx / 10);
++    item[7] = '0' + (idx % 10);
++    item[8] = '\0';
++  } else {
++    // For three-digit numbers
++    item[6] = '0' + (idx / 100);
++    item[7] = '0' + ((idx / 10) % 10);
++    item[8] = '0' + (idx % 10);
++    item[9] = '\0';
++  }
++
++  launchItem(item);
++}
+ 
+-    launchItem(item);
++// Handles custom menu entries
++// Returns 1 if OSDSYS should process the selection itself, 0 otherwise
++int handleMenuEntry(int selected) {
++  if (isProtokernelMenu) {
++    // Flat menu: entries 2.. map directly to the config items
++    if (selected == 1)
++      return 1;
++    if (selected >= 2 + settings.menuItemCount)
++      return 0;
++    if (selected - 2 >= 0)
++      launchConfigItem(selected - 2);
++    return 0;
++  }
++
++  if (currentFolder < 0) {
++    if (selected == 1)
++      return 1;
++    if (selected < 2 || selected >= 2 + visibleItems)
++      return 0;
++  } else if (selected < 0 || selected >= 1 + visibleItems) {
++    return 0;
++  }
++
++  // Menu entries carry the item position, see buildMenu()
++  uint32_t entry = osdMenu[selected * 2];
++  if ((entry & 0xffff0000) != OSD_MAGIC)
++    return 0;
++  entry &= 0xffff;
++
++  if (entry == OSD_BACK_ID) {
++    leaveFolder();
++    return 0;
+   }
++  if (entry >= CUSTOM_ITEMS)
++    return 0;
++  if (settings.menuItemIsFolder[entry]) {
++    enterFolder(entry);
++    return 0;
++  }
++
++  launchConfigItem(entry);
+   return 0;
+ }
+ 
+ // Returns the pointer to OSD string
+ const char *getStringPointer(const char **strings, uint32_t index) {
+-  if ((index & 0xffff0000) == OSD_MAGIC)
++  if ((index & 0xffff0000) == OSD_MAGIC) {
++    if ((index & 0xffff) == OSD_BACK_ID)
++      return settings.backText;
+     return settings.menuItemName[index & 0xffff];
++  }
+ 
+   return strings[index];
+ }
+@@ -145,13 +238,10 @@ void patchMenu(uint8_t *osd) {
+   osdMenu[3] = _lw(menuAddr - 3 * 4);
+ #endif
+ 
+-  for (i = 0; i < settings.menuItemCount; i++) {
+-    osdMenu[4 + i * 2] = OSD_MAGIC + i;
+-    osdMenu[5 + i * 2] = 0;
+-  }
+-
+-  menuInfo->menuPtr = osdMenu;                       // store menu pointer
+-  menuInfo->entryCount = 2 + settings.menuItemCount; // store number of menu items
++  // Remember the original entries and build the root menu
++  for (i = 0; i < 4; i++)
++    rootHead[i] = osdMenu[i];
++  buildMenu(-1);
+ }
+ 
+ static uint32_t colorSelected[4] __attribute__((aligned(16)));
+@@ -181,7 +271,7 @@ void drawMenuItemSelected(int X, int Y, uint32_t *color, int alpha, const char *
+     alpha = 0x80;
+ 
+   if (!(settings.patcherFlags & FLAG_SCROLL_MENU)) { // Old style menu
+-    DrawMenuItem(settings.menuX, Y - settings.menuItemCount * 10, colorSelected, alpha, string);
++    DrawMenuItem(settings.menuX, Y - visibleItems * 10, colorSelected, alpha, string);
+   } else { // New style menu
+     if (num == 0) {
+       int amount;
+@@ -222,7 +312,7 @@ void drawMenuItemUnselected(int X, int Y, uint32_t *color, int alpha, const char
+     colorUnselected[i] = settings.colorUnselected[i];
+ 
+   if (!(settings.patcherFlags & FLAG_SCROLL_MENU)) { // Old style menu
+-    DrawMenuItem(settings.menuX, Y - settings.menuItemCount * 10, colorUnselected, alpha, string);
++    DrawMenuItem(settings.menuX, Y - visibleItems * 10, colorUnselected, alpha, string);
+   } else { // New style menu
+     if (num == 0) {
+       int amount, destY = menuInfo->currentEntry << 4;
+@@ -704,6 +794,8 @@ void patchMenuProtokernel(uint8_t *osd) {
+     osdMenu[5 + i * 2] = (uint32_t)settings.menuItemName[i];
+   }
+ 
++  isProtokernelMenu = 1;
++  visibleItems = settings.menuItemCount;
+   menuInfo->menuPtr = osdMenu;                       // store menu pointer
+   menuInfo->entryCount = 2 + settings.menuItemCount; // store number of menu items
+ }
+diff --git a/patcher/src/settings.c b/patcher/src/settings.c
+index da32b2d..5d6bab0 100644
+--- a/patcher/src/settings.c
++++ b/patcher/src/settings.c
+@@ -8,6 +8,9 @@
+ 
+ PatcherSettings settings;
+ 
++// Parent folder (config file item index) of every item, indexed by config file item index. -1 means "root menu"
++static int16_t parentOfIdx[MAX_ITEM_IDX];
++
+ // Defined in common/defaults.h
+ #ifndef HOSD
+ char cnfPath[] = CONF_PATH;
+@@ -67,6 +70,45 @@ nextLine:
+   return 1;
+ }
+ 
++// Converts parent item indexes from the config file into item positions,
++// drops invalid or cyclic parents and marks the folder items
++static void resolveMenuHierarchy(void) {
++  int i, k, step, p;
++
++  for (i = 0; i < settings.menuItemCount; i++) {
++    settings.menuItemParent[i] = -1;
++    settings.menuItemIsFolder[i] = 0;
++  }
++
++  // Find the parent position of each item
++  for (i = 0; i < settings.menuItemCount; i++) {
++    int wanted = parentOfIdx[settings.menuItemIdx[i]];
++    if (wanted < 0)
++      continue;
++    for (k = 0; k < settings.menuItemCount; k++) {
++      if (k != i && settings.menuItemIdx[k] == wanted) {
++        settings.menuItemParent[i] = k;
++        break;
++      }
++    }
++  }
++
++  // Break cycles: every chain must reach the root in at most menuItemCount steps
++  for (i = 0; i < settings.menuItemCount; i++) {
++    p = settings.menuItemParent[i];
++    for (step = 0; p >= 0 && step <= settings.menuItemCount; step++)
++      p = settings.menuItemParent[p];
++    if (p >= 0)
++      settings.menuItemParent[i] = -1;
++  }
++
++  // Mark the folders
++  for (i = 0; i < settings.menuItemCount; i++) {
++    if (settings.menuItemParent[i] >= 0)
++      settings.menuItemIsFolder[settings.menuItemParent[i]] = 1;
++  }
++}
++
+ // Loads config file from the memory card
+ int loadConfig(void) {
+ #ifndef HOSD
+@@ -185,6 +227,17 @@ int loadConfig(void) {
+       }
+       continue;
+     }
++    if (!strncmp(name, "parent_OSDSYS_ITEM_", 19) && (strlen(value) > 0)) {
++      // Puts the item inside the folder item with the given index
++      j = atoi(&name[19]);
++      if (j >= 0 && j < MAX_ITEM_IDX)
++        parentOfIdx[j] = (int16_t)atoi(value);
++      continue;
++    }
++    if (!strcmp(name, "OSDSYS_submenu_back_text")) {
++      strncpy(settings.backText, value, sizeof(settings.backText) - 1);
++      continue;
++    }
+     if (!strncmp(name, "name_OSDSYS_ITEM_", 17) && (strlen(value) > 0)) {
+       // Ignore all subsequent entries if the number of items has been maxed out
+       if (settings.menuItemCount == CUSTOM_ITEMS)
+@@ -324,6 +377,8 @@ int loadConfig(void) {
+   if (pCNF != NULL)
+     free(pCNF);
+ 
++  resolveMenuHierarchy();
++
+   return 0;
+ }
+ 
+@@ -368,6 +423,13 @@ void initConfig(void) {
+     settings.menuItemIdx[i] = 0;
+   }
+   settings.menuItemCount = 0;
++  for (int i = 0; i < CUSTOM_ITEMS; i++) {
++    settings.menuItemParent[i] = -1;
++    settings.menuItemIsFolder[i] = 0;
++  }
++  for (int i = 0; i < MAX_ITEM_IDX; i++)
++    parentOfIdx[i] = -1;
++  strcpy(settings.backText, "< Back");
+   settings.romver[0] = '\0';
+ #ifndef HOSD
+   settings.dkwdrvPath[0] = '\0'; // Can be null

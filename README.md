@@ -217,6 +217,23 @@ New to OSDMenu/HOSDMenu:
 30. `ps1drv_enable_smooth` — will enable texture smoothing for PS1 discs when not using DKWDRV
 31. `ps1drv_use_ps1vn` — will run PS1DRV using the PS1DRV Video Mode Negator
 
+Submenus (fork):
+
+- `parent_OSDSYS_ITEM_???` — puts the item inside the folder item with the given index. An item that is the parent of at least one other item becomes a folder: selecting it opens its submenu instead of launching a path, and it needs no `path?_` entry. Items without `parent_` stay in the main menu. Invalid or circular parents are ignored (the item goes to the main menu). Not supported on protokernel consoles (SCPH-10000/15000), where all items are listed flat.
+- `OSDSYS_submenu_back_text` — text of the entry shown at the top of every submenu that returns to the previous level (default: `< Back`)
+
+Example:
+
+```
+name_OSDSYS_ITEM_1 = Games >
+name_OSDSYS_ITEM_2 = Game A
+path1_OSDSYS_ITEM_2 = mc0:/BOOT/NEUTRINO.ELF
+arg_OSDSYS_ITEM_2 = dvd:mass:/DVD/GameA.iso
+parent_OSDSYS_ITEM_2 = 1
+name_OSDSYS_ITEM_3 = uLaunchELF
+path1_OSDSYS_ITEM_3 = mc0:/BOOT/BOOT.ELF
+```
+
 Options exclusive to OSDMenu:
 
 32. `path_DKWDRV_ELF` — custom path to DKWDRV.ELF. The path MUST be on the memory card

@@ -26,55 +26,148 @@ static struct OSDMenuInfo *menuInfo = NULL;
 #define OSD_MAGIC 0x39390000 // arbitrary number to identify added menu items
 char item[10] = {0};
 
-// Handles custom menu entries
-int handleMenuEntry(int selected) {
-  if (selected == 1)
-    return 1;
+#define OSD_BACK_ID 0xfffe // item id of the "back" entry shown in submenus
 
-  if (selected >= 2 + settings.menuItemCount)
-    return 0;
+static uint32_t rootHead[4];        // Original "Browser" and "System Configuration" entries
+static int currentFolder = -1;      // Position of the folder being displayed, -1 for the root menu
+static int visibleItems = 0;        // Number of custom entries (folders and items) in the displayed menu
+static int isProtokernelMenu = 0;   // Protokernel menus are flat (no submenu support)
 
-  if (selected - 2 >= 0) {
-    // Build 'fmcb<mc slot>:<idx>' string for the launcher
-    int idx = settings.menuItemIdx[selected - 2];
+// Rebuilds the OSD menu array to show the contents of the given folder (-1 for the root menu)
+static void buildMenu(int folder) {
+  int i, n = 0;
+  uint32_t base;
 
-    item[0] = 'f';
-    item[1] = 'm';
-    item[2] = 'c';
-    item[3] = 'b';
-#ifndef HOSD
-    item[4] = '0' + settings.mcSlot;
-#else
-    item[4] = '9';
-#endif
-    item[5] = ':';
-
-    if (idx < 10) {
-      // For single-digit numbers
-      item[6] = '0' + idx;
-      item[7] = '\0';
-    } else if (idx < 100) {
-      // For two-digit numbers
-      item[6] = '0' + (idx / 10);
-      item[7] = '0' + (idx % 10);
-      item[8] = '\0';
-    } else {
-      // For three-digit numbers
-      item[6] = '0' + (idx / 100);
-      item[7] = '0' + ((idx / 10) % 10);
-      item[8] = '0' + (idx % 10);
-      item[9] = '\0';
-    }
-
-    launchItem(item);
+  if (folder < 0) {
+    for (i = 0; i < 4; i++)
+      osdMenu[i] = rootHead[i];
+    base = 4;
+  } else {
+    osdMenu[0] = OSD_MAGIC + OSD_BACK_ID;
+    osdMenu[1] = 0;
+    base = 2;
   }
+
+  for (i = 0; i < settings.menuItemCount; i++) {
+    if (settings.menuItemParent[i] != folder)
+      continue;
+    osdMenu[base + n * 2] = OSD_MAGIC + i;
+    osdMenu[base + n * 2 + 1] = 0;
+    n++;
+  }
+
+  visibleItems = n;
+  currentFolder = folder;
+  menuInfo->menuPtr = osdMenu;
+  menuInfo->entryCount = (base / 2) + n;
+}
+
+static void enterFolder(int folder) {
+  buildMenu(folder);
+  menuInfo->currentEntry = 0; // Cursor starts on the "back" entry
+}
+
+static void leaveFolder(void) {
+  uint32_t i, folder = currentFolder;
+
+  buildMenu(settings.menuItemParent[folder]);
+
+  // Put the cursor back on the folder we just left
+  menuInfo->currentEntry = 0;
+  for (i = 0; i < menuInfo->entryCount; i++) {
+    if (osdMenu[i * 2] == OSD_MAGIC + folder) {
+      menuInfo->currentEntry = i;
+      break;
+    }
+  }
+}
+
+// Builds the 'fmcb<mc slot>:<idx>' string for the item at the given position and launches it
+static void launchConfigItem(int pos) {
+  int idx = settings.menuItemIdx[pos];
+
+  item[0] = 'f';
+  item[1] = 'm';
+  item[2] = 'c';
+  item[3] = 'b';
+#ifndef HOSD
+  item[4] = '0' + settings.mcSlot;
+#else
+  item[4] = '9';
+#endif
+  item[5] = ':';
+
+  if (idx < 10) {
+    // For single-digit numbers
+    item[6] = '0' + idx;
+    item[7] = '\0';
+  } else if (idx < 100) {
+    // For two-digit numbers
+    item[6] = '0' + (idx / 10);
+    item[7] = '0' + (idx % 10);
+    item[8] = '\0';
+  } else {
+    // For three-digit numbers
+    item[6] = '0' + (idx / 100);
+    item[7] = '0' + ((idx / 10) % 10);
+    item[8] = '0' + (idx % 10);
+    item[9] = '\0';
+  }
+
+  launchItem(item);
+}
+
+// Handles custom menu entries
+// Returns 1 if OSDSYS should process the selection itself, 0 otherwise
+int handleMenuEntry(int selected) {
+  if (isProtokernelMenu) {
+    // Flat menu: entries 2.. map directly to the config items
+    if (selected == 1)
+      return 1;
+    if (selected >= 2 + settings.menuItemCount)
+      return 0;
+    if (selected - 2 >= 0)
+      launchConfigItem(selected - 2);
+    return 0;
+  }
+
+  if (currentFolder < 0) {
+    if (selected == 1)
+      return 1;
+    if (selected < 2 || selected >= 2 + visibleItems)
+      return 0;
+  } else if (selected < 0 || selected >= 1 + visibleItems) {
+    return 0;
+  }
+
+  // Menu entries carry the item position, see buildMenu()
+  uint32_t entry = osdMenu[selected * 2];
+  if ((entry & 0xffff0000) != OSD_MAGIC)
+    return 0;
+  entry &= 0xffff;
+
+  if (entry == OSD_BACK_ID) {
+    leaveFolder();
+    return 0;
+  }
+  if (entry >= CUSTOM_ITEMS)
+    return 0;
+  if (settings.menuItemIsFolder[entry]) {
+    enterFolder(entry);
+    return 0;
+  }
+
+  launchConfigItem(entry);
   return 0;
 }
 
 // Returns the pointer to OSD string
 const char *getStringPointer(const char **strings, uint32_t index) {
-  if ((index & 0xffff0000) == OSD_MAGIC)
+  if ((index & 0xffff0000) == OSD_MAGIC) {
+    if ((index & 0xffff) == OSD_BACK_ID)
+      return settings.backText;
     return settings.menuItemName[index & 0xffff];
+  }
 
   return strings[index];
 }
@@ -145,13 +238,10 @@ void patchMenu(uint8_t *osd) {
   osdMenu[3] = _lw(menuAddr - 3 * 4);
 #endif
 
-  for (i = 0; i < settings.menuItemCount; i++) {
-    osdMenu[4 + i * 2] = OSD_MAGIC + i;
-    osdMenu[5 + i * 2] = 0;
-  }
-
-  menuInfo->menuPtr = osdMenu;                       // store menu pointer
-  menuInfo->entryCount = 2 + settings.menuItemCount; // store number of menu items
+  // Remember the original entries and build the root menu
+  for (i = 0; i < 4; i++)
+    rootHead[i] = osdMenu[i];
+  buildMenu(-1);
 }
 
 static uint32_t colorSelected[4] __attribute__((aligned(16)));
@@ -181,7 +271,7 @@ void drawMenuItemSelected(int X, int Y, uint32_t *color, int alpha, const char *
     alpha = 0x80;
 
   if (!(settings.patcherFlags & FLAG_SCROLL_MENU)) { // Old style menu
-    DrawMenuItem(settings.menuX, Y - settings.menuItemCount * 10, colorSelected, alpha, string);
+    DrawMenuItem(settings.menuX, Y - visibleItems * 10, colorSelected, alpha, string);
   } else { // New style menu
     if (num == 0) {
       int amount;
@@ -222,7 +312,7 @@ void drawMenuItemUnselected(int X, int Y, uint32_t *color, int alpha, const char
     colorUnselected[i] = settings.colorUnselected[i];
 
   if (!(settings.patcherFlags & FLAG_SCROLL_MENU)) { // Old style menu
-    DrawMenuItem(settings.menuX, Y - settings.menuItemCount * 10, colorUnselected, alpha, string);
+    DrawMenuItem(settings.menuX, Y - visibleItems * 10, colorUnselected, alpha, string);
   } else { // New style menu
     if (num == 0) {
       int amount, destY = menuInfo->currentEntry << 4;
@@ -704,6 +794,8 @@ void patchMenuProtokernel(uint8_t *osd) {
     osdMenu[5 + i * 2] = (uint32_t)settings.menuItemName[i];
   }
 
+  isProtokernelMenu = 1;
+  visibleItems = settings.menuItemCount;
   menuInfo->menuPtr = osdMenu;                       // store menu pointer
   menuInfo->entryCount = 2 + settings.menuItemCount; // store number of menu items
 }
